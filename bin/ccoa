@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Run normally to install/authenticate/start the proxy and launch the existing Claude Code.
+# Management: --ccoa-stop-proxy, --ccoa-reauth
+# Optional: CCOA_AUTH_MODE=auto|browser|device, CCOA_MODEL, CCOA_EFFORT=medium
+
+readonly PROXY_REPOSITORY="raine/claude-code-proxy"
+readonly PROXY_LATEST_URL="https://github.com/${PROXY_REPOSITORY}/releases/latest"
+readonly PROXY_PORT="18765"
+readonly PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
+
+if [[ "${XDG_DATA_HOME:-}" == /* ]]; then
+  DATA_HOME="$XDG_DATA_HOME"
+else
+  DATA_HOME="$HOME/.local/share"
+fi
+if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+  CONFIG_HOME="$XDG_CONFIG_HOME"
+else
+  CONFIG_HOME="$HOME/.config"
+fi
+if [[ "${XDG_STATE_HOME:-}" == /* ]]; then
+  STATE_HOME="$XDG_STATE_HOME"
+else
+  STATE_HOME="$HOME/.local/state"
+fi
+readonly DATA_HOME CONFIG_HOME STATE_HOME
+
+readonly INSTALL_DIR="${DATA_HOME}/ccoa"
+readonly PROXY_BIN="${INSTALL_DIR}/claude-code-proxy"
+readonly PROXY_METADATA_FILE="${INSTALL_DIR}/claude-code-proxy.metadata"
+readonly CONFIG_DIR="${CONFIG_HOME}/ccoa"
+readonly PROXY_CONFIG_DIR="${CONFIG_DIR}/proxy"
+readonly STATE_DIR="${STATE_HOME}/ccoa"
+readonly PROXY_STATE_HOME="${STATE_DIR}/proxy-state"
+readonly PROXY_PRIVATE_HOME="${STATE_DIR}/proxy-home"
+readonly RUNTIME_DIR="${STATE_DIR}/runtime"
+readonly SETUP_LOCK="${RUNTIME_DIR}/setup.lock"
+readonly PROXY_LOCK="${RUNTIME_DIR}/proxy.lock"
+readonly SESSION_LOCK="${RUNTIME_DIR}/sessions.lock"
+readonly PID_FILE="${RUNTIME_DIR}/proxy.pid"
+readonly PROXY_LOG="${STATE_DIR}/proxy.log"
+readonly BOOT_ID_FILE="/proc/sys/kernel/random/boot_id"
+
+TMP_DIR=""
+CLAUDE_BIN=""
+PROXY_VERSION=""
+PROXY_RELEASE_TAG=""
+PROXY_PLATFORM=""
+PROXY_ARCHIVE_ASSET=""
+PROXY_CHECKSUM_ASSET=""
+PROXY_ARCHIVE_SHA256=""
+PROXY_BINARY_SHA256=""
+INSTALLED_PROXY_VERSION=""
+INSTALLED_PROXY_PLATFORM=""
+INSTALLED_PROXY_ARCHIVE_SHA256=""
+INSTALLED_PROXY_BINARY_SHA256=""
+TRACKED_PID=""
+TRACKED_START=""
+TRACKED_BOOT_ID=""
+TRACKED_BINARY_SHA256=""
+
+say() {
+  printf 'ccoa: %s\n' "$*"
+}
+
+fail() {
+  printf 'ccoa: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Missing required command '$1'. Install $2 and run this script again."
+}
+
+proxy_env() {
+  env \
+    HOME="$PROXY_PRIVATE_HOME" \
+    XDG_CONFIG_HOME="$PROXY_PRIVATE_HOME/.config" \
+    XDG_STATE_HOME="$PROXY_STATE_HOME" \
+    CCP_CONFIG_DIR="$PROXY_CONFIG_DIR" \
+    "$@"
+}
+
+health_check() {
+  local timeout="${1:-2}"
+  curl --disable --noproxy '*' -fsS \
+    --connect-timeout "$timeout" --max-time "$timeout" \
+    "${PROXY_URL}/healthz" 2>/dev/null |
+    grep -Eq '^\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true[[:space:]]*\}$'
+}
+
+current_boot_id() {
+  [[ -r "$BOOT_ID_FILE" ]] || return 1
+  read -r REPLY <"$BOOT_ID_FILE"
+  printf '%s\n' "$REPLY"
+}
+
+process_start_time() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  awk '{ print $22 }' "/proc/${pid}/stat"
+}
+
+process_matches_record() {
+  local pid="$1" expected_start="$2" expected_boot_id="$3"
+  local current_start state boot_id
+
+  [[ "$pid" =~ ^[0-9]+$ && "$expected_start" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null)" || return 1
+  [[ "$state" != "Z" && "$state" != "X" ]] || return 1
+  current_start="$(process_start_time "$pid")" || return 1
+  [[ "$current_start" == "$expected_start" ]] || return 1
+  boot_id="$(current_boot_id)" || return 1
+  [[ "$boot_id" == "$expected_boot_id" ]]
+}
+
+process_matches_proxy() {
+  local pid="$1" expected_start="$2" expected_boot_id="$3" expected_sha256="$4"
+  local actual_exe expected_exe actual_checksum
+
+  [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  process_matches_record "$pid" "$expected_start" "$expected_boot_id" || return 1
+  actual_exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+  expected_exe="$(readlink -f "$PROXY_BIN" 2>/dev/null || true)"
+  if [[ -n "$actual_exe" && -n "$expected_exe" && "$actual_exe" == "$expected_exe" ]]; then
+    return 0
+  fi
+
+  actual_checksum="$(sha256sum "/proc/${pid}/exe" 2>/dev/null | cut -d ' ' -f 1)" || return 1
+  [[ "$actual_checksum" == "$expected_sha256" ]]
+}
+
+read_tracked_process() {
+  local -a pid_data=()
+  TRACKED_PID=""
+  TRACKED_START=""
+  TRACKED_BOOT_ID=""
+  TRACKED_BINARY_SHA256=""
+
+  [[ -f "$PID_FILE" ]] || return 1
+  mapfile -t pid_data <"$PID_FILE"
+  ((${#pid_data[@]} == 4)) || return 1
+  [[ "${pid_data[0]}" =~ ^[0-9]+$ && "${pid_data[1]}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${pid_data[2]}" =~ ^[0-9a-fA-F-]+$ ]] || return 1
+  [[ "${pid_data[3]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  TRACKED_PID="${pid_data[0]}"
+  TRACKED_START="${pid_data[1]}"
+  TRACKED_BOOT_ID="${pid_data[2]}"
+  TRACKED_BINARY_SHA256="${pid_data[3]}"
+}
+
+tracked_process_is_proxy() {
+  read_tracked_process || return 1
+  process_matches_proxy "$TRACKED_PID" "$TRACKED_START" "$TRACKED_BOOT_ID" "$TRACKED_BINARY_SHA256"
+}
+
+proxy_lock_is_held() {
+  ! flock --nonblock "$PROXY_LOCK" true 2>/dev/null
+}
+
+managed_proxy_is_running() {
+  tracked_process_is_proxy && proxy_lock_is_held
+}
+
+proxy_owns_listener() {
+  local pid="$1" port_hex inode fd link
+  port_hex="$(printf '%04X' "$PROXY_PORT")"
+
+  while read -r inode; do
+    [[ -n "$inode" ]] || continue
+    for fd in "/proc/${pid}/fd/"*; do
+      link="$(readlink "$fd" 2>/dev/null || true)"
+      [[ "$link" == "socket:[${inode}]" ]] && return 0
+    done
+  done < <(awk -v endpoint="0100007F:${port_hex}" '$2 == endpoint && $4 == "0A" { print $10 }' /proc/net/tcp)
+
+  return 1
+}
+
+signal_locked_process() {
+  local pid="$1" signal="$2" lock_pid
+
+  [[ -r "$PROXY_LOCK" ]] || return 1
+  read -r lock_pid <"$PROXY_LOCK" || return 1
+  [[ "$lock_pid" == "$pid" ]] || return 1
+  pkill \
+    --signal "$signal" \
+    --logpidfile \
+    --pidfile "$PROXY_LOCK" \
+    >/dev/null 2>&1
+}
+
+stop_proxy() {
+  local pid start_time boot_id binary_sha256 i
+
+  if ! managed_proxy_is_running; then
+    if proxy_lock_is_held; then
+      fail "The proxy singleton lock is held, but its process cannot be verified. Refusing to kill an unknown process."
+    fi
+    rm -f -- "$PID_FILE"
+    say "proxy is not running"
+    return
+  fi
+
+  pid="$TRACKED_PID"
+  start_time="$TRACKED_START"
+  boot_id="$TRACKED_BOOT_ID"
+  binary_sha256="$TRACKED_BINARY_SHA256"
+  say "stopping proxy (PID ${pid})"
+
+  if process_matches_proxy "$pid" "$start_time" "$boot_id" "$binary_sha256"; then
+    signal_locked_process "$pid" TERM || true
+  fi
+  for ((i = 0; i < 50; i++)); do
+    process_matches_record "$pid" "$start_time" "$boot_id" || break
+    sleep 0.1
+  done
+  if process_matches_proxy "$pid" "$start_time" "$boot_id" "$binary_sha256"; then
+    signal_locked_process "$pid" KILL || true
+  fi
+  for ((i = 0; i < 50; i++)); do
+    process_matches_record "$pid" "$start_time" "$boot_id" || break
+    sleep 0.1
+  done
+  process_matches_record "$pid" "$start_time" "$boot_id" &&
+    fail "Proxy PID ${pid} did not stop."
+
+  for ((i = 0; i < 50; i++)); do
+    proxy_lock_is_held || break
+    sleep 0.1
+  done
+  proxy_lock_is_held && fail "Proxy stopped, but its singleton lock was not released."
+
+  rm -f -- "$PID_FILE"
+  say "proxy stopped"
+}
+
+select_proxy_artifact() {
+  case "$(uname -m)" in
+    x86_64 | amd64)
+      PROXY_PLATFORM="linux-amd64"
+      ;;
+    aarch64 | arm64)
+      PROXY_PLATFORM="linux-arm64"
+      ;;
+    *)
+      fail "Unsupported CPU architecture: $(uname -m). Supported architectures are x86_64 and arm64."
+      ;;
+  esac
+
+  PROXY_ARCHIVE_ASSET="claude-code-proxy-${PROXY_PLATFORM}.tar.gz"
+  PROXY_CHECKSUM_ASSET="claude-code-proxy-${PROXY_PLATFORM}.sha256"
+}
+
+resolve_latest_proxy_release() {
+  local effective_url checksum_url checksum_file checksum_name
+  local -a checksum_lines=()
+
+  effective_url="$(curl --disable -fsSLI -o /dev/null -w '%{url_effective}' "$PROXY_LATEST_URL")" ||
+    fail "Could not resolve the latest claude-code-proxy release."
+  PROXY_RELEASE_TAG="${effective_url##*/}"
+  PROXY_RELEASE_TAG="${PROXY_RELEASE_TAG%%\?*}"
+  [[ "$PROXY_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]] ||
+    fail "GitHub returned an unexpected latest-release tag: ${PROXY_RELEASE_TAG}"
+  PROXY_VERSION="${PROXY_RELEASE_TAG#v}"
+
+  checksum_file="${TMP_DIR}/${PROXY_CHECKSUM_ASSET}"
+  checksum_url="https://github.com/${PROXY_REPOSITORY}/releases/download/${PROXY_RELEASE_TAG}/${PROXY_CHECKSUM_ASSET}"
+  curl --disable -fL --retry 3 --proto '=https' --tlsv1.2 -o "$checksum_file" "$checksum_url"
+
+  mapfile -t checksum_lines <"$checksum_file"
+  ((${#checksum_lines[@]} == 1)) || fail "The latest release checksum file has an unexpected format."
+  read -r PROXY_ARCHIVE_SHA256 checksum_name <<<"${checksum_lines[0]}"
+  PROXY_ARCHIVE_SHA256="${PROXY_ARCHIVE_SHA256,,}"
+  [[ "$PROXY_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ && "$checksum_name" == "$PROXY_ARCHIVE_ASSET" ]] ||
+    fail "The latest release checksum file has invalid contents."
+}
+
+read_installed_proxy_metadata() {
+  local -a metadata=()
+  INSTALLED_PROXY_VERSION=""
+  INSTALLED_PROXY_PLATFORM=""
+  INSTALLED_PROXY_ARCHIVE_SHA256=""
+  INSTALLED_PROXY_BINARY_SHA256=""
+
+  [[ -f "$PROXY_METADATA_FILE" ]] || return 1
+  mapfile -t metadata <"$PROXY_METADATA_FILE"
+  ((${#metadata[@]} == 4)) || return 1
+  [[ "${metadata[0]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]] || return 1
+  [[ "${metadata[1]}" == "linux-amd64" || "${metadata[1]}" == "linux-arm64" ]] || return 1
+  [[ "${metadata[2]}" =~ ^[0-9a-f]{64}$ && "${metadata[3]}" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  INSTALLED_PROXY_VERSION="${metadata[0]}"
+  INSTALLED_PROXY_PLATFORM="${metadata[1]}"
+  INSTALLED_PROXY_ARCHIVE_SHA256="${metadata[2]}"
+  INSTALLED_PROXY_BINARY_SHA256="${metadata[3]}"
+}
+
+write_proxy_metadata() {
+  local temporary="${PROXY_METADATA_FILE}.tmp.$$"
+  printf '%s\n%s\n%s\n%s\n' \
+    "$PROXY_VERSION" \
+    "$PROXY_PLATFORM" \
+    "$PROXY_ARCHIVE_SHA256" \
+    "$PROXY_BINARY_SHA256" \
+    >"$temporary"
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$PROXY_METADATA_FILE"
+}
+
+verify_proxy_binary() {
+  local binary="$1" expected_sha256="$2" expected_version="$3"
+  local actual_checksum version_output
+
+  [[ -f "$binary" && -x "$binary" && "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual_checksum="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+  [[ "$actual_checksum" == "$expected_sha256" ]] || return 1
+  version_output="$(proxy_env "$binary" --version 2>/dev/null || true)"
+  [[ "$version_output" == "claude-code-proxy ${expected_version}" ]]
+}
+
+sessions_are_active() {
+  ! flock --exclusive --nonblock "$SESSION_LOCK" true 2>/dev/null
+}
+
+install_latest_proxy() {
+  local archive_url archive actual_checksum archive_entries extracted staged
+
+  resolve_latest_proxy_release
+
+  if [[ -e "$PROXY_BIN" ]]; then
+    read_installed_proxy_metadata ||
+      fail "The installed proxy has no valid metadata: ${PROXY_METADATA_FILE}. Remove both proxy files, then run this script again."
+    verify_proxy_binary "$PROXY_BIN" "$INSTALLED_PROXY_BINARY_SHA256" "$INSTALLED_PROXY_VERSION" ||
+      fail "The installed proxy failed checksum or version verification: ${PROXY_BIN}. Remove both proxy files, then run this script again."
+
+    if [[ "$INSTALLED_PROXY_VERSION" == "$PROXY_VERSION" &&
+      "$INSTALLED_PROXY_PLATFORM" == "$PROXY_PLATFORM" &&
+      "$INSTALLED_PROXY_ARCHIVE_SHA256" == "$PROXY_ARCHIVE_SHA256" ]]; then
+      PROXY_BINARY_SHA256="$INSTALLED_PROXY_BINARY_SHA256"
+      return
+    fi
+  elif [[ -e "$PROXY_METADATA_FILE" ]]; then
+    fail "Proxy metadata exists without its executable: ${PROXY_METADATA_FILE}. Remove it, then run this script again."
+  fi
+
+  if sessions_are_active; then
+    fail "claude-code-proxy ${PROXY_VERSION} is available, but another ccoa Claude session is active. Close existing ccoa sessions and retry the update."
+  fi
+  if managed_proxy_is_running; then
+    stop_proxy
+  elif proxy_lock_is_held; then
+    fail "The proxy singleton lock is held, but its process cannot be verified. Refusing to replace the running executable."
+  fi
+
+  archive="${TMP_DIR}/${PROXY_ARCHIVE_ASSET}"
+  archive_url="https://github.com/${PROXY_REPOSITORY}/releases/download/${PROXY_RELEASE_TAG}/${PROXY_ARCHIVE_ASSET}"
+
+  say "downloading latest claude-code-proxy ${PROXY_VERSION} for ${PROXY_PLATFORM}"
+  curl --disable -fL --retry 3 --proto '=https' --tlsv1.2 -o "$archive" "$archive_url"
+
+  actual_checksum="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  [[ "$actual_checksum" == "$PROXY_ARCHIVE_SHA256" ]] ||
+    fail "Proxy archive checksum mismatch: expected ${PROXY_ARCHIVE_SHA256}, got ${actual_checksum}."
+
+  archive_entries="$(tar -tzf "$archive")"
+  [[ "$archive_entries" == "claude-code-proxy" ]] ||
+    fail "Proxy archive has an unexpected layout; refusing to extract it."
+
+  extracted="${TMP_DIR}/extracted"
+  mkdir -m 700 "$extracted"
+  tar --extract --gzip --file "$archive" --directory "$extracted" --no-same-owner
+
+  PROXY_BINARY_SHA256="$(sha256sum "$extracted/claude-code-proxy" | cut -d ' ' -f 1)"
+  [[ "$PROXY_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "Could not hash the extracted proxy executable."
+
+  staged="${INSTALL_DIR}/.claude-code-proxy.$$"
+  install -m 0755 "$extracted/claude-code-proxy" "$staged"
+  if ! verify_proxy_binary "$staged" "$PROXY_BINARY_SHA256" "$PROXY_VERSION"; then
+    rm -f -- "$staged"
+    fail "Downloaded proxy failed executable checksum or version verification."
+  fi
+  mv -f -- "$staged" "$PROXY_BIN"
+  write_proxy_metadata
+}
+
+resolve_claude() {
+  local candidate version_output
+
+  candidate="$(type -P claude 2>/dev/null || true)"
+  [[ -n "$candidate" ]] ||
+    fail "Claude Code is not installed or 'claude' is not on PATH. Install it system-wide, then run this script again."
+  candidate="$(readlink -f "$candidate")" ||
+    fail "Could not resolve the installed 'claude' executable."
+  version_output="$("$candidate" --version 2>/dev/null || true)"
+  [[ "$version_output" == *"(Claude Code)"* ]] ||
+    fail "The 'claude' executable on PATH is not Claude Code: ${candidate}"
+  CLAUDE_BIN="$candidate"
+}
+
+authenticate_if_needed() {
+  local status rc auth_mode force_login
+
+  force_login="${CCOA_FORCE_LOGIN:-0}"
+  if [[ "$force_login" == "1" ]]; then
+    rc=1
+    status="Forced login requested"
+  else
+    set +e
+    status="$(proxy_env "$PROXY_BIN" codex auth status 2>&1)"
+    rc=$?
+    set -e
+  fi
+
+  case "$rc" in
+    0)
+      return
+      ;;
+    1)
+      ;;
+    *)
+      fail "Could not read proxy authentication state: ${status}"
+      ;;
+  esac
+
+  auth_mode="${CCOA_AUTH_MODE:-auto}"
+  if [[ "$auth_mode" == "auto" ]]; then
+    if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+      auth_mode="device"
+    elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+      auth_mode="browser"
+    else
+      auth_mode="device"
+    fi
+  fi
+
+  case "$auth_mode" in
+    browser | login)
+      say "ChatGPT login is required. Open the URL printed below; the callback listener uses 127.0.0.1:1455."
+      proxy_env "$PROXY_BIN" codex auth login
+      ;;
+    device)
+      say "ChatGPT login is required. Follow the device-login instructions printed below."
+      proxy_env "$PROXY_BIN" codex auth device
+      ;;
+    *)
+      fail "Invalid CCOA_AUTH_MODE '${auth_mode}'. Use auto, browser, or device."
+      ;;
+  esac
+
+  proxy_env "$PROXY_BIN" codex auth status >/dev/null ||
+    fail "ChatGPT login did not produce a proxy credential."
+}
+
+terminate_started_process() {
+  local pid="$1" start_time="$2" boot_id="$3" i
+
+  if process_matches_record "$pid" "$start_time" "$boot_id"; then
+    signal_locked_process "$pid" TERM || true
+  fi
+  for ((i = 0; i < 50; i++)); do
+    process_matches_record "$pid" "$start_time" "$boot_id" || break
+    sleep 0.1
+  done
+  if process_matches_record "$pid" "$start_time" "$boot_id"; then
+    signal_locked_process "$pid" KILL || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+start_or_reuse_proxy() {
+  local pid start_time boot_id deadline
+
+  if managed_proxy_is_running; then
+    if proxy_owns_listener "$TRACKED_PID" && health_check; then
+      return
+    fi
+    say "tracked proxy is not healthy; restarting it"
+    stop_proxy
+  elif health_check; then
+    fail "Something is answering ${PROXY_URL}/healthz, but it is not the proxy managed by this script. Refusing to reuse it."
+  elif proxy_lock_is_held; then
+    fail "The proxy singleton lock is held, but its process cannot be verified. See ${PROXY_LOG}."
+  else
+    rm -f -- "$PID_FILE"
+  fi
+
+  say "starting claude-code-proxy on 127.0.0.1:${PROXY_PORT}"
+  # The single-quoted script is expanded by the lock-owning child shell.
+  # shellcheck disable=SC2016
+  nohup flock --nonblock --no-fork "$PROXY_LOCK" \
+    env \
+      CCOA_PID_FILE="$PID_FILE" \
+      CCOA_PROXY_LOCK="$PROXY_LOCK" \
+      CCOA_PROXY_BIN="$PROXY_BIN" \
+      CCOA_PROXY_SHA256="$PROXY_BINARY_SHA256" \
+      CCOA_PROXY_PORT="$PROXY_PORT" \
+      CCOA_PROXY_WORK_DIR="$PROXY_PRIVATE_HOME" \
+      HOME="$PROXY_PRIVATE_HOME" \
+      XDG_CONFIG_HOME="$PROXY_PRIVATE_HOME/.config" \
+      XDG_STATE_HOME="$PROXY_STATE_HOME" \
+      CCP_CONFIG_DIR="$PROXY_CONFIG_DIR" \
+      CCP_BIND_ADDRESS=127.0.0.1 \
+      CCP_CODEX_PREVIOUS_RESPONSE_ID=true \
+      CCP_CODEX_SERVER_COMPACTION=true \
+      bash -c '
+        pid=$$
+        printf "%s\n" "$pid" >"$CCOA_PROXY_LOCK" || exit 1
+        start_time=$(awk "{ print \$22 }" "/proc/${pid}/stat") || exit 1
+        read -r boot_id < /proc/sys/kernel/random/boot_id || exit 1
+        temporary="${CCOA_PID_FILE}.tmp.${pid}"
+        trap '\''rm -f -- "$temporary"'\'' EXIT
+        printf "%s\n%s\n%s\n%s\n" "$pid" "$start_time" "$boot_id" "$CCOA_PROXY_SHA256" >"$temporary" || exit 1
+        chmod 600 "$temporary" || exit 1
+        mv -f -- "$temporary" "$CCOA_PID_FILE" || exit 1
+        trap - EXIT
+        cd "$CCOA_PROXY_WORK_DIR" || exit 1
+        exec "$CCOA_PROXY_BIN" serve --no-monitor --port "$CCOA_PROXY_PORT"
+      ' \
+    </dev/null >>"$PROXY_LOG" 2>&1 9>&- &
+  pid=$!
+  start_time="$(process_start_time "$pid")" || fail "Could not record the proxy startup process."
+  boot_id="$(current_boot_id)" || fail "Could not read the Linux boot ID."
+  deadline=$((SECONDS + 10))
+
+  while ((SECONDS < deadline)); do
+    if ! process_matches_record "$pid" "$start_time" "$boot_id"; then
+      printf 'ccoa: proxy exited during startup. Recent log output:\n' >&2
+      tail -n 40 "$PROXY_LOG" >&2 || true
+      wait "$pid" 2>/dev/null || true
+      exit 1
+    fi
+
+    if managed_proxy_is_running && [[ "$TRACKED_PID" == "$pid" ]] &&
+      proxy_owns_listener "$pid" && health_check 0.5; then
+      say "proxy is ready (PID ${pid})"
+      return
+    fi
+    sleep 0.1
+  done
+
+  terminate_started_process "$pid" "$start_time" "$boot_id"
+  rm -f -- "$PID_FILE"
+  fail "Proxy did not become ready within 10 seconds. See ${PROXY_LOG}."
+}
+
+launch_claude() {
+  local opus_model sonnet_model haiku_model custom_model main_model small_model max_output_tokens capabilities no_proxy_value existing
+
+  opus_model="${CCOA_OPUS_MODEL:-gpt-5.6-sol[1m]}"
+  sonnet_model="${CCOA_SONNET_MODEL:-gpt-5.6-terra[1m]}"
+  haiku_model="${CCOA_HAIKU_MODEL:-gpt-5.6-luna[1m]}"
+  custom_model="${CCOA_CUSTOM_MODEL:-gpt-6-astra[1m]}"
+  main_model="${CCOA_MODEL:-$custom_model}"
+  small_model="${CCOA_SMALL_MODEL:-$haiku_model}"
+  max_output_tokens="${CCOA_MAX_OUTPUT_TOKENS:-128000}"
+  capabilities="effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking"
+
+  no_proxy_value="127.0.0.1,localhost"
+  for existing in "${NO_PROXY:-}" "${no_proxy:-}"; do
+    [[ -z "$existing" ]] || no_proxy_value+=",${existing}"
+  done
+
+  env \
+    -u ANTHROPIC_API_KEY \
+    -u CLAUDE_CODE_USE_ANTHROPIC_AWS \
+    -u CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+    -u CLAUDE_CODE_USE_BEDROCK \
+    -u CLAUDE_CODE_USE_FOUNDRY \
+    -u CLAUDE_CODE_USE_MANTLE \
+    -u CLAUDE_CODE_USE_VERTEX \
+    NO_PROXY="$no_proxy_value" \
+    no_proxy="$no_proxy_value" \
+    ANTHROPIC_BASE_URL="$PROXY_URL" \
+    ANTHROPIC_AUTH_TOKEN=unused \
+    ANTHROPIC_MODEL="$main_model" \
+    ANTHROPIC_SMALL_FAST_MODEL="$small_model" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$opus_model" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="GPT-5.6 Sol" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="GPT-5.6 reasoning model via ChatGPT" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$sonnet_model" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="GPT-5.6 Terra" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION="Balanced Codex model via ChatGPT" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$haiku_model" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="GPT-5.6 Luna" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION="Fast Codex model via ChatGPT" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
+    ANTHROPIC_CUSTOM_MODEL_OPTION="$custom_model" \
+    ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-6 Astra" \
+    ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="GPT-6 Codex model via ChatGPT" \
+    ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="$capabilities" \
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+    DISABLE_AUTO_COMPACT=0 \
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_output_tokens" \
+    "$CLAUDE_BIN" --permission-mode auto --effort "${CCOA_EFFORT:-medium}" "$@" 8>&-
+}
+
+require_glibc_239() {
+  local output version major minor
+
+  output="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  [[ "$output" =~ ([0-9]+)\.([0-9]+) ]] ||
+    fail "The current claude-code-proxy Linux release requires glibc 2.39 or newer; this system's libc could not be identified."
+  version="${BASH_REMATCH[0]}"
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  ((10#$major > 2 || (10#$major == 2 && 10#$minor >= 39))) ||
+    fail "The current claude-code-proxy Linux release requires glibc 2.39 or newer; this system has ${version}."
+}
+
+main() {
+  [[ "$(uname -s)" == "Linux" ]] || fail "This installer supports Linux only."
+  ((EUID != 0)) || fail "Do not run this script with sudo or as root. Run it as the user who will use Claude Code."
+
+  require_command env coreutils
+  require_command sha256sum coreutils
+  require_command cut coreutils
+  require_command readlink coreutils
+  require_command flock util-linux
+  require_command awk awk
+  require_command pkill procps
+
+  umask 077
+  mkdir -p \
+    "$INSTALL_DIR" \
+    "$CONFIG_DIR" \
+    "$PROXY_CONFIG_DIR" \
+    "$STATE_DIR" \
+    "$PROXY_STATE_HOME" \
+    "$PROXY_PRIVATE_HOME/.config" \
+    "$RUNTIME_DIR"
+  chmod 700 \
+    "$INSTALL_DIR" \
+    "$CONFIG_DIR" \
+    "$PROXY_CONFIG_DIR" \
+    "$STATE_DIR" \
+    "$PROXY_STATE_HOME" \
+    "$PROXY_PRIVATE_HOME" \
+    "$PROXY_PRIVATE_HOME/.config" \
+    "$RUNTIME_DIR"
+
+  exec 9>"$SETUP_LOCK"
+  flock 9
+
+  select_proxy_artifact
+  if [[ "${1:-}" == "--ccoa-reauth" ]]; then
+    export CCOA_FORCE_LOGIN=1
+    shift
+  fi
+  if [[ "${1:-}" == "--ccoa-stop-proxy" ]]; then
+    stop_proxy
+    return
+  fi
+
+  require_command curl curl
+  require_command grep grep
+  require_command tar tar
+  require_command install coreutils
+  require_command tail coreutils
+  require_command getconf libc-bin
+  require_glibc_239
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ccoa.XXXXXXXX")"
+  chmod 700 "$TMP_DIR"
+
+  resolve_claude
+  install_latest_proxy
+
+  if [[ "${CCOA_FORCE_LOGIN:-0}" == "1" ]] && managed_proxy_is_running; then
+    stop_proxy
+  fi
+  authenticate_if_needed
+  start_or_reuse_proxy
+
+  # Hold the session lock in this shell, not Claude or its background children.
+  exec 8>"$SESSION_LOCK"
+  flock --shared 8
+  flock --unlock 9
+  exec 9>&-
+  cleanup
+  TMP_DIR=""
+  trap - EXIT
+
+  launch_claude "$@"
+}
+
+main "$@"

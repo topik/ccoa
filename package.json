@@ -1,0 +1,47 @@
+{
+  "name": "ccoa",
+  "version": "0.1.0",
+  "description": "Run your installed Claude Code through a local ChatGPT-backed claude-code-proxy on Linux.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/topik/ccoa.git"
+  },
+  "homepage": "https://github.com/topik/ccoa#readme",
+  "bugs": {
+    "url": "https://github.com/topik/ccoa/issues"
+  },
+  "type": "module",
+  "bin": {
+    "ccoa": "bin/ccoa"
+  },
+  "files": [
+    "bin/ccoa",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "claude-code",
+    "chatgpt",
+    "codex",
+    "proxy",
+    "linux"
+  ]
+}

@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+.env
+.env.*
+.claude/
+.DS_Store

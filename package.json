@@ -1,6 +1,6 @@
 {
   "name": "@iamtopik/ccoa",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Run your installed Claude Code through a local ChatGPT-backed claude-code-proxy on Linux.",
   "license": "MIT",
   "repository": {

@@ -558,9 +558,9 @@ start_or_reuse_proxy() {
 launch_claude() {
   local opus_model sonnet_model haiku_model custom_model main_model small_model max_output_tokens capabilities no_proxy_value existing
 
-  opus_model="${CCOA_OPUS_MODEL:-gpt-5.6-sol[1m]}"
+  opus_model="${CCOA_OPUS_MODEL:-gpt-6-sol[1m]}"
   sonnet_model="${CCOA_SONNET_MODEL:-gpt-5.6-terra[1m]}"
-  haiku_model="${CCOA_HAIKU_MODEL:-gpt-5.6-luna[1m]}"
+  haiku_model="${CCOA_HAIKU_MODEL:-gpt-6-luna[1m]}"
   custom_model="${CCOA_CUSTOM_MODEL:-gpt-6-astra[1m]}"
   main_model="${CCOA_MODEL:-$custom_model}"
   small_model="${CCOA_SMALL_MODEL:-$haiku_model}"
@@ -587,15 +587,15 @@ launch_claude() {
     ANTHROPIC_MODEL="$main_model" \
     ANTHROPIC_SMALL_FAST_MODEL="$small_model" \
     ANTHROPIC_DEFAULT_OPUS_MODEL="$opus_model" \
-    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="GPT-5.6 Sol" \
-    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="GPT-5.6 reasoning model via ChatGPT" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="GPT-6 Sol" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="GPT-6 reasoning model via ChatGPT" \
     ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
     ANTHROPIC_DEFAULT_SONNET_MODEL="$sonnet_model" \
     ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="GPT-5.6 Terra" \
     ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION="Balanced Codex model via ChatGPT" \
     ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$haiku_model" \
-    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="GPT-5.6 Luna" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="GPT-6 Luna" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION="Fast Codex model via ChatGPT" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES="$capabilities" \
     ANTHROPIC_CUSTOM_MODEL_OPTION="$custom_model" \

@@ -64,9 +64,12 @@ test('Astra and medium effort are the defaults; model aliases are preserved', ()
     assert.deepEqual(args, ['--permission-mode', 'auto', '--effort', 'medium']);
     assert.equal(env.ANTHROPIC_MODEL, 'gpt-6-astra[1m]');
     assert.equal(env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'GPT-6 Astra');
-    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'gpt-5.6-sol[1m]');
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'gpt-6-sol[1m]');
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, 'GPT-6 Sol');
     assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'gpt-5.6-terra[1m]');
-    assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'gpt-5.6-luna[1m]');
+    assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'gpt-6-luna[1m]');
+    assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, 'GPT-6 Luna');
+    assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'gpt-6-luna[1m]');
     assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:18765');
     assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '128000');
   });

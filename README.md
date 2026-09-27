@@ -41,6 +41,9 @@ Your defaults are already set:
 | Setting | Default |
 | --- | --- |
 | Main model | GPT-6 Astra |
+| Opus alias | GPT-6 Sol |
+| Sonnet alias | GPT-5.6 Terra |
+| Haiku alias and small/fast model | GPT-6 Luna |
 | Effort | Medium |
 | Proxy | `http://127.0.0.1:18765` |
 
@@ -91,7 +94,8 @@ ccoa --effort high
 Choose another model:
 
 ```bash
-CCOA_MODEL='gpt-5.6-sol[1m]' ccoa
+CCOA_MODEL='gpt-6-sol[1m]' ccoa
+CCOA_MODEL='gpt-6-luna[1m]' ccoa
 ```
 
 Other Claude Code arguments pass through unchanged. ccoa defaults to permission
